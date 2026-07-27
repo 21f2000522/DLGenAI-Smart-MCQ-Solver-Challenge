@@ -1,0 +1,538 @@
+import torch
+import transformers
+import accelerate
+import sentencepiece
+
+print("PyTorch version:", torch.__version__)
+print("Transformers version:", transformers.__version__)
+print("Accelerate version:", accelerate.__version__)
+print("SentencePiece version:", sentencepiece.__version__)
+
+print("CUDA available:", torch.cuda.is_available())
+
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
+
+
+
+import os
+import gc
+import random
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, DataCollatorWithPadding, get_linear_schedule_with_warmup
+from tqdm.auto import tqdm
+
+
+
+seed = 42
+model_name = "microsoft/deberta-v3-base"
+max_length = 256
+epochs = 3
+train_batch_size = 4
+valid_batch_size = 8
+gradient_accumulation_steps = 2
+learning_rate = 2e-5
+weight_decay = 0.01
+warmup_ratio = 0.10
+data_path = "/kaggle/input/competitions/smart-mcq-solver-challenge/"
+checkpoint_path = "/kaggle/working/best_deberta_v5"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+print("Model:", model_name)
+
+
+
+
+def set_seed(seed_value):
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed_value)
+        torch.cuda.manual_seed_all(seed_value)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(seed)
+
+
+
+
+train = pd.read_csv(data_path + "train.csv")
+test = pd.read_csv(data_path + "test.csv")
+print("Training shape:", train.shape)
+print("Test shape:", test.shape)
+display(train.head())
+
+
+
+train_data, valid_data = train_test_split(
+    train,
+    test_size=0.20,
+    random_state=seed,
+    stratify=train["answer"]
+)
+train_data = train_data.reset_index(drop=True)
+valid_data = valid_data.reset_index(drop=True)
+print("Training questions:", len(train_data))
+print("Validation questions:", len(valid_data))
+
+
+
+
+letters = ["A", "B", "C", "D", "E"]
+
+def create_pair_dataframe(data, include_labels=True):
+    rows = []
+    for question_index in range(len(data)):
+        prompt = str(data.iloc[question_index]["prompt"])
+        if include_labels:
+            correct_answer = str(data.iloc[question_index]["answer"])
+        for option_position, letter in enumerate(letters):
+            option = str(data.iloc[question_index][letter])
+            row = {
+                "question_index": question_index,
+                "option_letter": letter,
+                "option_position": option_position,
+                "prompt": prompt,
+                "option": option
+            }
+            if include_labels:
+                row["label"] = 1 if letter == correct_answer else 0
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+train_pairs = create_pair_dataframe(train_data, True)
+valid_pairs = create_pair_dataframe(valid_data, True)
+test_pairs = create_pair_dataframe(test, False)
+print(train_pairs.shape, valid_pairs.shape, test_pairs.shape)
+display(train_pairs.head(10))
+
+
+
+
+tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+
+class MCQPairDataset(Dataset):
+    def __init__(self, dataframe, tokenizer, max_length, include_labels=True):
+        self.dataframe = dataframe.reset_index(drop=True)
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.include_labels = include_labels
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, index):
+        prompt = str(self.dataframe.iloc[index]["prompt"])
+        option = str(self.dataframe.iloc[index]["option"])
+        encoding = self.tokenizer(
+            prompt,
+            option,
+            truncation=True,
+            max_length=self.max_length
+        )
+        if self.include_labels:
+            encoding["labels"] = int(self.dataframe.iloc[index]["label"])
+        return encoding
+
+
+
+train_dataset = MCQPairDataset(train_pairs, tokenizer, max_length, True)
+valid_dataset = MCQPairDataset(valid_pairs, tokenizer, max_length, True)
+test_dataset = MCQPairDataset(test_pairs, tokenizer, max_length, False)
+
+data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding="longest", return_tensors="pt")
+
+train_loader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True, collate_fn=data_collator, num_workers=2, pin_memory=True)
+valid_loader = DataLoader(valid_dataset, batch_size=valid_batch_size, shuffle=False, collate_fn=data_collator, num_workers=2, pin_memory=True)
+test_loader = DataLoader(test_dataset, batch_size=valid_batch_size, shuffle=False, collate_fn=data_collator, num_workers=2, pin_memory=True)
+
+print(len(train_loader), len(valid_loader), len(test_loader))
+
+
+
+
+def create_top_three_answers(scores, number_of_questions):
+    predictions = []
+    for question_index in range(number_of_questions):
+        start = question_index * 5
+        one_question_scores = scores[start:start + 5]
+        top_three_positions = np.argsort(one_question_scores)[-3:][::-1]
+        predictions.append(" ".join([letters[position] for position in top_three_positions]))
+    return predictions
+
+def calculate_map3(actual_answers, predicted_answers):
+    actual_answers = actual_answers.reset_index(drop=True)
+    total_score = 0
+    for index in range(len(actual_answers)):
+        correct_answer = actual_answers.iloc[index]
+        top_three = predicted_answers[index].split()
+        if correct_answer == top_three[0]:
+            total_score += 1.0
+        elif correct_answer == top_three[1]:
+            total_score += 0.5
+        elif correct_answer == top_three[2]:
+            total_score += 1 / 3
+    return total_score / len(actual_answers)
+
+
+
+model = AutoModelForSequenceClassification.from_pretrained(
+    model_name,
+    num_labels=2,
+    torch_dtype=torch.float32
+)
+
+
+model = model.float()
+model = model.to(device)
+
+print("Model device:", next(model.parameters()).device)
+print("First parameter dtype:", next(model.parameters()).dtype)
+
+
+
+parameter_dtypes = {}
+
+for name, parameter in model.named_parameters():
+
+    if parameter.requires_grad:
+
+        dtype_name = str(parameter.dtype)
+
+        parameter_dtypes[dtype_name] = (
+            parameter_dtypes.get(dtype_name, 0) + 1
+        )
+
+print("Trainable parameter dtypes:", parameter_dtypes)
+
+
+
+no_decay = [
+    "bias",
+    "LayerNorm.weight"
+]
+
+optimizer_parameters = [
+    {
+        "params": [
+            parameter
+            for name, parameter in model.named_parameters()
+            if not any(
+                item in name
+                for item in no_decay
+            )
+        ],
+        "weight_decay": weight_decay
+    },
+    {
+        "params": [
+            parameter
+            for name, parameter in model.named_parameters()
+            if any(
+                item in name
+                for item in no_decay
+            )
+        ],
+        "weight_decay": 0.0
+    }
+]
+
+optimizer = torch.optim.AdamW(
+    optimizer_parameters,
+    lr=learning_rate
+)
+
+updates_per_epoch = int(
+    np.ceil(
+        len(train_loader) /
+        gradient_accumulation_steps
+    )
+)
+
+total_training_steps = (
+    updates_per_epoch * epochs
+)
+
+warmup_steps = int(
+    total_training_steps * warmup_ratio
+)
+
+scheduler = get_linear_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=warmup_steps,
+    num_training_steps=total_training_steps
+)
+
+print("Total optimiser steps:", total_training_steps)
+
+
+
+
+use_amp = (
+    torch.cuda.is_available()
+    and next(model.parameters()).dtype == torch.float32
+)
+
+scaler = torch.amp.GradScaler(
+    "cuda",
+    enabled=use_amp
+)
+
+print("AMP enabled:", use_amp)
+
+
+def move_batch_to_device(batch):
+
+    return {
+        key: value.to(device)
+        for key, value in batch.items()
+    }
+
+
+def train_one_epoch(model, data_loader):
+
+    model.train()
+
+    total_loss = 0.0
+
+    optimizer.zero_grad(
+        set_to_none=True
+    )
+
+    progress_bar = tqdm(
+        data_loader,
+        desc="Training"
+    )
+
+    for step, batch in enumerate(progress_bar):
+
+        batch = move_batch_to_device(batch)
+
+        with torch.amp.autocast(
+            device_type="cuda",
+            dtype=torch.float16,
+            enabled=use_amp
+        ):
+
+            outputs = model(**batch)
+
+            loss = (
+                outputs.loss /
+                gradient_accumulation_steps
+            )
+
+        scaler.scale(loss).backward()
+
+        should_update = (
+            (step + 1)
+            % gradient_accumulation_steps == 0
+            or
+            (step + 1) == len(data_loader)
+        )
+
+        if should_update:
+
+            scaler.unscale_(optimizer)
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=1.0
+            )
+
+            scaler.step(optimizer)
+            scaler.update()
+
+            optimizer.zero_grad(
+                set_to_none=True
+            )
+
+            scheduler.step()
+
+        total_loss += (
+            loss.item()
+            * gradient_accumulation_steps
+        )
+
+        progress_bar.set_postfix({
+            "loss": total_loss / (step + 1)
+        })
+
+    average_loss = (
+        total_loss / len(data_loader)
+    )
+
+    return average_loss
+
+
+def validate_model(model, data_loader):
+
+    model.eval()
+
+    total_loss = 0.0
+    positive_probabilities = []
+
+    with torch.no_grad():
+
+        progress_bar = tqdm(
+            data_loader,
+            desc="Validation"
+        )
+
+        for batch in progress_bar:
+
+            batch = move_batch_to_device(batch)
+
+            with torch.amp.autocast(
+                device_type="cuda",
+                dtype=torch.float16,
+                enabled=use_amp
+            ):
+
+                outputs = model(**batch)
+
+            total_loss += outputs.loss.item()
+
+            probabilities = torch.softmax(
+                outputs.logits,
+                dim=1
+            )
+
+            positive_probabilities.extend(
+                probabilities[:, 1]
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+    average_loss = (
+        total_loss / len(data_loader)
+    )
+
+    return (
+        average_loss,
+        np.array(positive_probabilities)
+    )
+
+
+
+print("Model dtype:", next(model.parameters()).dtype)
+print("AMP enabled:", use_amp)
+
+wrong_dtype_parameters = []
+
+for name, parameter in model.named_parameters():
+
+    if (
+        parameter.requires_grad
+        and parameter.dtype != torch.float32
+    ):
+
+        wrong_dtype_parameters.append(
+            (name, parameter.dtype)
+        )
+
+print(
+    "Non-float32 trainable parameters:",
+    wrong_dtype_parameters[:10]
+)
+
+optimizer_dtypes = set()
+
+for group in optimizer.param_groups:
+
+    for parameter in group["params"]:
+
+        optimizer_dtypes.add(
+            parameter.dtype
+        )
+
+print(
+    "Optimiser parameter dtypes:",
+    optimizer_dtypes
+)
+
+
+
+best_map3 = -1
+training_history = []
+os.makedirs(checkpoint_path, exist_ok=True)
+
+for epoch in range(epochs):
+    print("\n" + "=" * 60)
+    print("Epoch", epoch + 1, "of", epochs)
+    print("=" * 60)
+
+    train_loss = train_one_epoch(model, train_loader)
+    valid_loss, valid_scores = validate_model(model, valid_loader)
+    valid_predictions = create_top_three_answers(valid_scores, len(valid_data))
+    valid_map3 = calculate_map3(valid_data["answer"], valid_predictions)
+
+    training_history.append({
+        "epoch": epoch + 1,
+        "train_loss": train_loss,
+        "valid_loss": valid_loss,
+        "valid_map3": valid_map3
+    })
+
+    print("Train loss:", train_loss)
+    print("Validation loss:", valid_loss)
+    print("Validation MAP@3:", valid_map3)
+
+    if valid_map3 > best_map3:
+        best_map3 = valid_map3
+        model.save_pretrained(checkpoint_path)
+        tokenizer.save_pretrained(checkpoint_path)
+        print("Best model saved")
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+history = pd.DataFrame(training_history)
+display(history)
+print("Best validation MAP@3:", best_map3)
+
+
+
+
+best_model = AutoModelForSequenceClassification.from_pretrained(checkpoint_path).to(device)
+best_model.eval()
+
+def predict_model(model, data_loader):
+    positive_probabilities = []
+    model.eval()
+    with torch.no_grad():
+        for batch in tqdm(data_loader, desc="Test prediction"):
+            batch = move_batch_to_device(batch)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                outputs = model(**batch)
+            probabilities = torch.softmax(outputs.logits, dim=1)
+            positive_probabilities.extend(probabilities[:, 1].detach().cpu().numpy())
+    return np.array(positive_probabilities)
+
+test_scores = predict_model(best_model, test_loader)
+final_answers = create_top_three_answers(test_scores, len(test))
+print("Predictions:", len(final_answers))
+print(final_answers[:10])
+
+
+
+
+submission = pd.DataFrame()
+submission["ID"] = test["id"]
+submission["Prediction"] = final_answers
+submission.to_csv("submission.csv", index=False)
+
+display(submission.head())
+print("Submission shape:", submission.shape)
+print("File created:", os.path.exists("submission.csv"))
+
+
+history.to_csv("version_5_training_history.csv", index=False)
+print("Training history saved")
