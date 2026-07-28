@@ -1,0 +1,995 @@
+import torch
+import transformers
+import accelerate
+import sentencepiece
+
+print("PyTorch version:", torch.__version__)
+print("Transformers version:", transformers.__version__)
+print("Accelerate version:", accelerate.__version__)
+print("SentencePiece version:", sentencepiece.__version__)
+
+print("CUDA available:", torch.cuda.is_available())
+
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
+
+
+
+seed = 42
+
+model_name = "microsoft/deberta-v3-base"
+
+data_path = (
+    "/kaggle/input/competitions/"
+    "smart-mcq-solver-challenge/"
+)
+
+output_path = "/kaggle/working/version_6_models"
+
+number_of_folds = 3
+epochs = 2
+max_length = 256
+train_batch_size = 2
+valid_batch_size = 4
+gradient_accumulation_steps = 4
+learning_rate = 1e-5
+weight_decay = 0.01
+warmup_ratio = 0.10
+
+letters = ["A", "B", "C", "D", "E"]
+device = torch.device(
+    "cuda" if torch.cuda.is_available()
+    else "cpu"
+)
+
+os.makedirs(
+    output_path,
+    exist_ok=True
+)
+
+print("Device:", device)
+if torch.cuda.is_available():
+    print(
+        "GPU:",
+        torch.cuda.get_device_name(0)
+    )
+
+print("Model:", model_name)
+print("Number of folds:", number_of_folds)
+
+
+def set_seed(seed_value):
+
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+
+    torch.manual_seed(seed_value)
+
+    if torch.cuda.is_available():
+
+        torch.cuda.manual_seed(
+            seed_value
+        )
+
+        torch.cuda.manual_seed_all(
+            seed_value
+        )
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+set_seed(seed)
+
+
+
+train = pd.read_csv(data_path + "train.csv")
+
+test = pd.read_csv(data_path + "test.csv")
+
+print("Training shape:", train.shape)
+print("Test shape:", test.shape)
+
+display(train.head())
+
+
+
+tokenizer = AutoTokenizer.from_pretrained(
+    model_name,
+    use_fast=True
+)
+
+print(
+    "Tokenizer loaded"
+)
+
+
+class MCQDataset(Dataset):
+
+    def __init__(
+        self,
+        dataframe,
+        tokenizer,
+        max_length,
+        include_labels=True
+    ):
+
+        self.dataframe = (
+            dataframe
+            .reset_index(drop=True)
+        )
+
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.include_labels = include_labels
+
+        self.answer_to_number = {
+            "A": 0,
+            "B": 1,
+            "C": 2,
+            "D": 3,
+            "E": 4
+        }
+
+
+    def __len__(self):
+
+        return len(
+            self.dataframe
+        )
+
+
+    def __getitem__(self, index):
+
+        row = self.dataframe.iloc[index]
+        prompt = str(row["prompt"])
+        options = []
+
+        for letter in letters:
+
+            option = str(row[letter])
+            options.append(option)
+
+        repeated_prompts = [
+            prompt
+            for _ in range(5)
+        ]
+
+        encoding = self.tokenizer(
+            repeated_prompts,
+            options,
+            truncation=True,
+            max_length=self.max_length,
+            padding=False
+        )
+
+        item = {
+            key: value
+            for key, value in encoding.items()
+        }
+
+        if self.include_labels:
+
+            answer = str(
+                row["answer"]
+            )
+
+            item["labels"] = (
+                self.answer_to_number[
+                    answer
+                ]
+            )
+
+        return item
+
+
+
+
+
+class MultipleChoiceCollator:
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+
+    def __call__(self, features):
+
+        labels = None
+        if "labels" in features[0]:
+
+            labels = [
+                feature.pop("labels")
+                for feature in features
+            ]
+
+        batch_size = len(features)
+        number_of_choices = len(features[0]["input_ids"])
+        flattened_features = []
+
+        for feature in features:
+
+            for choice_index in range(number_of_choices):
+                one_choice = {}
+
+                for key, value in feature.items():
+                    one_choice[key] = (value[choice_index])
+
+                flattened_features.append(one_choice)
+
+        batch = self.tokenizer.pad(
+            flattened_features,
+            padding=True,
+            return_tensors="pt"
+        )
+
+        for key, value in batch.items():
+
+            batch[key] = value.view(
+                batch_size,
+                number_of_choices,
+                -1
+            )
+
+        if labels is not None:
+
+            batch["labels"] = torch.tensor(
+                labels,
+                dtype=torch.long
+            )
+
+        return batch
+
+
+data_collator = MultipleChoiceCollator(
+    tokenizer
+)
+
+
+
+def probabilities_to_predictions(probabilities):   
+
+    predictions = []
+
+    for row in probabilities:
+
+        top_three_positions = (np.argsort(row)[-3:][::-1])
+        top_three_letters = []
+
+        for position in top_three_positions:
+
+            top_three_letters.append(letters[position])
+
+        prediction = " ".join(top_three_letters)
+
+        predictions.append(prediction)
+
+    return predictions
+
+
+    
+def calculate_map3(actual_answers,predicted_answers):
+
+    actual_answers = (actual_answers.reset_index(drop=True))
+    total_score = 0.0
+
+    for index in range(len(actual_answers)):
+        actual = str(actual_answers.iloc[index])
+
+        predicted = (predicted_answers[index].split())
+
+        if actual == predicted[0]:
+            total_score += 1.0
+
+        elif actual == predicted[1]:
+            total_score += 0.5
+
+        elif actual == predicted[2]:
+            total_score += 1 / 3
+
+    map3 = (total_score / len(actual_answers))
+
+    return map3
+
+
+
+def train_one_epoch(
+    model,
+    data_loader,
+    optimizer,
+    scheduler,
+    scaler,
+    use_amp
+):
+
+    model.train()
+
+    total_loss = 0.0
+
+    optimizer.zero_grad(
+        set_to_none=True
+    )
+
+    progress_bar = tqdm(
+        data_loader,
+        desc="Training"
+    )
+
+    for step, batch in enumerate(
+        progress_bar
+    ):
+
+        batch = {
+            key: value.to(
+                device,
+                non_blocking=True
+            )
+            for key, value in batch.items()
+        }
+
+        with torch.amp.autocast(
+            device_type="cuda",
+            dtype=torch.float16,
+            enabled=use_amp
+        ):
+
+            outputs = model(
+                **batch
+            )
+
+            loss = (
+                outputs.loss /
+                gradient_accumulation_steps
+            )
+
+        scaler.scale(
+            loss
+        ).backward()
+
+        should_update = (
+            (
+                step + 1
+            ) % gradient_accumulation_steps == 0
+            or
+            (
+                step + 1
+            ) == len(data_loader)
+        )
+
+        if should_update:
+
+            scaler.unscale_(
+                optimizer
+            )
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=1.0
+            )
+
+            scaler.step(
+                optimizer
+            )
+
+            scaler.update()
+
+            optimizer.zero_grad(
+                set_to_none=True
+            )
+
+            scheduler.step()
+
+        original_loss = (
+            loss.item() *
+            gradient_accumulation_steps
+        )
+
+        total_loss += original_loss
+
+        progress_bar.set_postfix({
+            "loss":
+            total_loss / (step + 1)
+        })
+
+    average_loss = (
+        total_loss /
+        len(data_loader)
+    )
+
+    return average_loss
+
+
+
+
+def validate_model(
+    model,
+    data_loader,
+    use_amp
+):
+
+    model.eval()
+
+    total_loss = 0.0
+    all_probabilities = []
+
+    progress_bar = tqdm(
+        data_loader,
+        desc="Validation"
+    )
+
+    with torch.no_grad():
+
+        for batch in progress_bar:
+
+            batch = {
+                key: value.to(
+                    device,
+                    non_blocking=True
+                )
+                for key, value in batch.items()
+            }
+
+            with torch.amp.autocast(
+                device_type="cuda",
+                dtype=torch.float16,
+                enabled=use_amp
+            ):
+
+                outputs = model(
+                    **batch
+                )
+
+            total_loss += (
+                outputs.loss.item()
+            )
+
+            probabilities = torch.softmax(
+                outputs.logits,
+                dim=1
+            )
+
+            all_probabilities.append(
+                probabilities
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+    all_probabilities = np.concatenate(
+        all_probabilities,
+        axis=0
+    )
+
+    average_loss = (
+        total_loss /
+        len(data_loader)
+    )
+
+    return (
+        average_loss,
+        all_probabilities
+    )
+
+
+
+
+def predict_test(
+    model,
+    data_loader,
+    use_amp
+):
+
+    model.eval()
+
+    all_probabilities = []
+
+    progress_bar = tqdm(
+        data_loader,
+        desc="Test prediction"
+    )
+
+    with torch.no_grad():
+
+        for batch in progress_bar:
+
+            batch = {
+                key: value.to(
+                    device,
+                    non_blocking=True
+                )
+                for key, value in batch.items()
+            }
+
+            with torch.amp.autocast(
+                device_type="cuda",
+                dtype=torch.float16,
+                enabled=use_amp
+            ):
+
+                outputs = model(
+                    **batch
+                )
+
+            probabilities = torch.softmax(
+                outputs.logits,
+                dim=1
+            )
+
+            all_probabilities.append(
+                probabilities
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+    all_probabilities = np.concatenate(
+        all_probabilities,
+        axis=0
+    )
+
+    return all_probabilities
+
+
+
+
+stratified_folds = StratifiedKFold(
+    n_splits=number_of_folds,
+    shuffle=True,
+    random_state=seed
+)
+
+test_dataset = MCQDataset(
+    test,
+    tokenizer,
+    max_length,
+    include_labels=False
+)
+
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=valid_batch_size,
+    shuffle=False,
+    collate_fn=data_collator,
+    num_workers=2,
+    pin_memory=True
+)
+
+out_of_fold_probabilities = np.zeros(
+    (
+        len(train),
+        5
+    ),
+    dtype=np.float32
+)
+
+test_probability_sum = np.zeros(
+    (
+        len(test),
+        5
+    ),
+    dtype=np.float32
+)
+
+fold_results = []
+
+
+
+for fold_number, (
+    train_indices,
+    valid_indices
+) in enumerate(
+
+    stratified_folds.split(
+        train,
+        train["answer"]
+    )
+):
+
+    print("\n")
+    print("=" * 70)
+    print(
+        "Fold",
+        fold_number + 1,
+        "of",
+        number_of_folds
+    )
+    print("=" * 70)
+
+    set_seed(
+        seed + fold_number
+    )
+
+    fold_train = (
+        train.iloc[train_indices]
+        .reset_index(drop=True)
+    )
+
+    fold_valid = (
+        train.iloc[valid_indices]
+        .reset_index(drop=True)
+    )
+
+    print(
+        "Fold training questions:",
+        len(fold_train)
+    )
+
+    print(
+        "Fold validation questions:",
+        len(fold_valid)
+    )
+
+    train_dataset = MCQDataset(
+        fold_train,
+        tokenizer,
+        max_length,
+        include_labels=True
+    )
+
+    valid_dataset = MCQDataset(
+        fold_valid,
+        tokenizer,
+        max_length,
+        include_labels=True
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=train_batch_size,
+        shuffle=True,
+        collate_fn=data_collator,
+        num_workers=2,
+        pin_memory=True
+    )
+
+    valid_loader = DataLoader(
+        valid_dataset,
+        batch_size=valid_batch_size,
+        shuffle=False,
+        collate_fn=data_collator,
+        num_workers=2,
+        pin_memory=True
+    )
+
+    model = (
+        AutoModelForMultipleChoice
+        .from_pretrained(
+            model_name,
+            torch_dtype=torch.float32
+        )
+    )
+
+    model = model.float()
+    model = model.to(device)
+
+    print(
+        "Model dtype:",
+        next(model.parameters()).dtype
+    )
+
+    no_decay = [
+        "bias",
+        "LayerNorm.weight"
+    ]
+
+    optimizer_parameters = [
+        {
+            "params": [
+                parameter
+                for name, parameter
+                in model.named_parameters()
+                if not any(
+                    item in name
+                    for item in no_decay
+                )
+            ],
+            "weight_decay":
+            weight_decay
+        },
+        {
+            "params": [
+                parameter
+                for name, parameter
+                in model.named_parameters()
+                if any(
+                    item in name
+                    for item in no_decay
+                )
+            ],
+            "weight_decay":
+            0.0
+        }
+    ]
+
+    optimizer = torch.optim.AdamW(
+        optimizer_parameters,
+        lr=learning_rate
+    )
+
+    updates_per_epoch = int(
+        np.ceil(
+            len(train_loader) /
+            gradient_accumulation_steps
+        )
+    )
+
+    total_training_steps = (
+        updates_per_epoch *
+        epochs
+    )
+
+    warmup_steps = int(
+        total_training_steps *
+        warmup_ratio
+    )
+
+    scheduler = (
+        get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=
+            warmup_steps,
+            num_training_steps=
+            total_training_steps
+        )
+    )
+
+    use_amp = (
+        torch.cuda.is_available()
+    )
+
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=use_amp
+    )
+
+    fold_checkpoint = os.path.join(
+        output_path,
+        "fold_" + str(
+            fold_number + 1
+        )
+    )
+
+    os.makedirs(
+        fold_checkpoint,
+        exist_ok=True
+    )
+
+    best_fold_map3 = -1.0
+    best_valid_probabilities = None
+
+    for epoch in range(epochs):
+
+        print("\n")
+        print("-" * 60)
+        print(
+            "Fold",
+            fold_number + 1,
+            "- Epoch",
+            epoch + 1,
+            "of",
+            epochs
+        )
+        print("-" * 60)
+
+        train_loss = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            scheduler,
+            scaler,
+            use_amp
+        )
+
+        (
+            valid_loss,
+            valid_probabilities
+        ) = validate_model(
+            model,
+            valid_loader,
+            use_amp
+        )
+
+        valid_predictions = (
+            probabilities_to_predictions(
+                valid_probabilities
+            )
+        )
+
+        valid_map3 = calculate_map3(
+            fold_valid["answer"],
+            valid_predictions
+        )
+
+        print(
+            "Training loss:",
+            train_loss
+        )
+
+        print(
+            "Validation loss:",
+            valid_loss
+        )
+
+        print(
+            "Validation MAP@3:",
+            valid_map3
+        )
+
+        if valid_map3 > best_fold_map3:
+
+            best_fold_map3 = (
+                valid_map3
+            )
+
+            best_valid_probabilities = (
+                valid_probabilities.copy()
+            )
+
+            model.save_pretrained(
+                fold_checkpoint
+            )
+
+            tokenizer.save_pretrained(
+                fold_checkpoint
+            )
+
+            print(
+                "Best fold model saved"
+            )
+
+    out_of_fold_probabilities[
+        valid_indices
+    ] = best_valid_probabilities
+
+    best_model = (
+        AutoModelForMultipleChoice
+        .from_pretrained(
+            fold_checkpoint,
+            torch_dtype=torch.float32
+        )
+    )
+
+    best_model = best_model.float()
+    best_model = best_model.to(device)
+
+    fold_test_probabilities = (
+        predict_test(
+            best_model,
+            test_loader,
+            use_amp
+        )
+    )
+
+    test_probability_sum += (
+        fold_test_probabilities
+    )
+
+    fold_results.append({
+        "fold": fold_number + 1,
+        "best_map3": best_fold_map3
+    })
+
+    print(
+        "Best MAP@3 for fold:",
+        best_fold_map3
+    )
+
+    del model
+    del best_model
+    del optimizer
+    del scheduler
+    del scaler
+    del train_dataset
+    del valid_dataset
+    del train_loader
+    del valid_loader
+
+    gc.collect()
+
+    if torch.cuda.is_available():
+
+        torch.cuda.empty_cache()
+
+
+
+out_of_fold_predictions = (
+    probabilities_to_predictions(
+        out_of_fold_probabilities
+    )
+)
+
+overall_map3 = calculate_map3(
+    train["answer"],
+    out_of_fold_predictions
+)
+
+fold_results_dataframe = pd.DataFrame(
+    fold_results
+)
+
+display(
+    fold_results_dataframe
+)
+
+print(
+    "Overall out-of-fold MAP@3:",
+    overall_map3
+)
+
+print(
+    "Average fold MAP@3:",
+    fold_results_dataframe[
+        "best_map3"
+    ].mean()
+)
+
+
+
+average_test_probabilities = (
+    test_probability_sum /
+    number_of_folds
+)
+
+print(
+    "Test probability shape:",
+    average_test_probabilities.shape
+)
+
+print(
+    "First question probabilities:"
+)
+
+print(
+    average_test_probabilities[0]
+)
+
+
+
+final_answers = (
+    probabilities_to_predictions(
+        average_test_probabilities
+    )
+)
+
+print(
+    "Number of predictions:",
+    len(final_answers)
+)
+
+print(
+    "First ten predictions:"
+)
+
+print(
+    final_answers[:10]
+)
+
+
+
+submission = pd.DataFrame()
+
+submission["ID"] = test["id"]
+
+submission["Prediction"] = (
+    final_answers
+)
+
+submission.to_csv(
+    "/kaggle/working/submission.csv",
+    index=False
+)
+
+display(
+    submission.head(10)
+)
+
+print(
+    "Submission shape:",
+    submission.shape
+)
+
+print(
+    "Submission created:",
+    os.path.exists(
+        "/kaggle/working/submission.csv"
+    )
+)
