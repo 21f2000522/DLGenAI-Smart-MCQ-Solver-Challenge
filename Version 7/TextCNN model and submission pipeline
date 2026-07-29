@@ -1,0 +1,996 @@
+import os
+import re
+import random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+
+
+# Random seed
+seed = 42
+
+# Maximum number of words in each question-option pair
+max_length = 128
+
+# Training settings
+batch_size = 32
+number_of_epochs = 10
+learning_rate = 0.001
+
+# Model settings
+embedding_size = 128
+number_of_filters = 128
+dropout_rate = 0.30
+
+# Options available in every question
+option_columns = ["A", "B", "C", "D", "E"]
+
+# Using GPU when available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print("Device:", device)
+
+
+def set_seed(seed_value):
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+
+    torch.manual_seed(seed_value)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed_value)
+        torch.cuda.manual_seed_all(seed_value)
+
+
+set_seed(seed)
+
+
+
+train_path = "/kaggle/input/competitions/smart-mcq-solver-challenge/train.csv"
+test_path = "/kaggle/input/competitions/smart-mcq-solver-challenge/test.csv"
+
+train = pd.read_csv(train_path)
+test = pd.read_csv(test_path)
+
+print("Train shape:", train.shape)
+print("Test shape:", test.shape)
+
+train.head()
+
+
+print("Train columns:")
+print(train.columns.tolist())
+
+print("\nTest columns:")
+print(test.columns.tolist())
+
+
+
+text_columns = ["prompt", "A", "B", "C", "D", "E"]
+
+for column in text_columns:
+    train[column] = train[column].fillna("").astype(str)
+    test[column] = test[column].fillna("").astype(str)
+
+train["answer"] = train["answer"].astype(str)
+
+print(train["answer"].value_counts().sort_index())
+
+
+
+answer_to_number = {
+    "A": 0,
+    "B": 1,
+    "C": 2,
+    "D": 3,
+    "E": 4
+}
+
+number_to_answer = {
+    0: "A",
+    1: "B",
+    2: "C",
+    3: "D",
+    4: "E"
+}
+
+train["label"] = train["answer"].map(answer_to_number)
+
+print(train[["answer", "label"]].head())
+
+
+print("Missing labels:", train["label"].isnull().sum())
+
+
+
+def simple_tokenizer(text):
+    text = str(text).lower()
+
+    # Keep letters, numbers and basic apostrophes
+    text = re.sub(r"[^a-z0-9']", " ", text)
+
+    # Remove additional spaces
+    text = re.sub(r"\s+", " ", text).strip()
+
+    words = text.split()
+
+    return words
+
+
+sample_text = train.loc[0, "prompt"]
+
+print("Original text:")
+print(sample_text)
+
+print("\nTokenized text:")
+print(simple_tokenizer(sample_text))
+
+
+
+word_counts = {}
+
+for row_number in range(len(train)):
+    prompt = train.iloc[row_number]["prompt"]
+
+    for option in option_columns:
+        option_text = train.iloc[row_number][option]
+
+        combined_text = prompt + " " + option_text
+
+        words = simple_tokenizer(combined_text)
+
+        for word in words:
+            if word in word_counts:
+                word_counts[word] += 1
+            else:
+                word_counts[word] = 1
+
+
+
+minimum_word_frequency = 2
+
+word_to_number = {
+    "<PAD>": 0,
+    "<UNK>": 1
+}
+
+for word, count in word_counts.items():
+    if count >= minimum_word_frequency:
+        word_to_number[word] = len(word_to_number)
+
+number_to_word = {}
+
+for word, number in word_to_number.items():
+    number_to_word[number] = word
+
+vocabulary_size = len(word_to_number)
+
+print("Vocabulary size:", vocabulary_size)
+
+
+
+def text_to_numbers(text, word_to_number, max_length):
+    words = simple_tokenizer(text)
+
+    token_numbers = []
+
+    for word in words:
+        if word in word_to_number:
+            token_numbers.append(word_to_number[word])
+        else:
+            token_numbers.append(word_to_number["<UNK>"])
+
+    # Shorten long sequences
+    token_numbers = token_numbers[:max_length]
+
+    # Add padding to short sequences
+    number_of_padding_tokens = max_length - len(token_numbers)
+
+    token_numbers = token_numbers + (
+        [word_to_number["<PAD>"]] * number_of_padding_tokens
+    )
+
+    return token_numbers
+
+
+
+sample_numbers = text_to_numbers(
+    train.loc[0, "prompt"],
+    word_to_number,
+    max_length
+)
+
+print("Number of tokens:", len(sample_numbers))
+print(sample_numbers[:20])
+
+
+
+train_data, validation_data = train_test_split(
+    train,
+    test_size=0.20,
+    random_state=seed,
+    stratify=train["label"]
+)
+
+train_data = train_data.reset_index(drop=True)
+validation_data = validation_data.reset_index(drop=True)
+
+print("Training rows:", len(train_data))
+print("Validation rows:", len(validation_data))
+
+
+print("Training label distribution:")
+print(train_data["answer"].value_counts(normalize=True).sort_index())
+
+print("\nValidation label distribution:")
+print(validation_data["answer"].value_counts(normalize=True).sort_index())
+
+
+class MCQDataset(Dataset):
+
+    def __init__(
+        self,
+        dataframe,
+        word_to_number,
+        max_length,
+        is_test=False
+    ):
+        self.dataframe = dataframe.reset_index(drop=True)
+        self.word_to_number = word_to_number
+        self.max_length = max_length
+        self.is_test = is_test
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, index):
+        row = self.dataframe.iloc[index]
+
+        prompt = str(row["prompt"])
+
+        all_option_tokens = []
+
+        for option in option_columns:
+            option_text = str(row[option])
+
+            # Add a separator word between question and option
+            combined_text = prompt + " separator " + option_text
+
+            token_numbers = text_to_numbers(
+                combined_text,
+                self.word_to_number,
+                self.max_length
+            )
+
+            all_option_tokens.append(token_numbers)
+
+        input_ids = torch.tensor(
+            all_option_tokens,
+            dtype=torch.long
+        )
+
+        if self.is_test:
+            return {
+                "input_ids": input_ids
+            }
+
+        label = torch.tensor(
+            int(row["label"]),
+            dtype=torch.long
+        )
+
+        return {
+            "input_ids": input_ids,
+            "label": label
+        }
+
+
+
+training_dataset = MCQDataset(
+    dataframe=train_data,
+    word_to_number=word_to_number,
+    max_length=max_length,
+    is_test=False
+)
+
+validation_dataset = MCQDataset(
+    dataframe=validation_data,
+    word_to_number=word_to_number,
+    max_length=max_length,
+    is_test=False
+)
+
+test_dataset = MCQDataset(
+    dataframe=test,
+    word_to_number=word_to_number,
+    max_length=max_length,
+    is_test=True
+)
+
+
+
+training_loader = DataLoader(
+    training_dataset,
+    batch_size=batch_size,
+    shuffle=True,
+    num_workers=2,
+    pin_memory=True
+)
+
+validation_loader = DataLoader(
+    validation_dataset,
+    batch_size=batch_size,
+    shuffle=False,
+    num_workers=2,
+    pin_memory=True
+)
+
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=batch_size,
+    shuffle=False,
+    num_workers=2,
+    pin_memory=True
+)
+
+print("Training batches:", len(training_loader))
+print("Validation batches:", len(validation_loader))
+print("Test batches:", len(test_loader))
+
+
+sample_batch = next(iter(training_loader))
+
+print("Input shape:", sample_batch["input_ids"].shape)
+print("Label shape:", sample_batch["label"].shape)
+
+
+
+
+
+class TextCNNMultipleChoice(nn.Module):
+
+    def __init__(
+        self,
+        vocabulary_size,
+        embedding_size,
+        number_of_filters,
+        dropout_rate
+    ):
+        super().__init__()
+
+        # Randomly initialised embedding layer
+        self.embedding = nn.Embedding(
+            num_embeddings=vocabulary_size,
+            embedding_dim=embedding_size,
+            padding_idx=0
+        )
+
+        # Convolution layers with different kernel sizes
+        self.convolution_2 = nn.Conv1d(
+            in_channels=embedding_size,
+            out_channels=number_of_filters,
+            kernel_size=2
+        )
+
+        self.convolution_3 = nn.Conv1d(
+            in_channels=embedding_size,
+            out_channels=number_of_filters,
+            kernel_size=3
+        )
+
+        self.convolution_4 = nn.Conv1d(
+            in_channels=embedding_size,
+            out_channels=number_of_filters,
+            kernel_size=4
+        )
+
+        self.relu = nn.ReLU()
+
+        self.dropout = nn.Dropout(dropout_rate)
+
+        # Each option receives one score
+        self.output_layer = nn.Linear(
+            number_of_filters * 3,
+            1
+        )
+
+    def apply_convolution(self, embedded_text, convolution_layer):
+        convolution_output = convolution_layer(embedded_text)
+
+        convolution_output = self.relu(convolution_output)
+
+        # Global max pooling
+        pooled_output = torch.max(
+            convolution_output,
+            dim=2
+        ).values
+
+        return pooled_output
+
+    def forward(self, input_ids):
+        batch_size = input_ids.size(0)
+        number_of_options = input_ids.size(1)
+        sequence_length = input_ids.size(2)
+
+        # Changing shape from:
+        # batch × 5 × sequence
+        #
+        # to:
+        # (batch × 5) × sequence
+        input_ids = input_ids.view(
+            batch_size * number_of_options,
+            sequence_length
+        )
+
+        # Shape:
+        # (batch × 5) × sequence × embedding
+        embedded_text = self.embedding(input_ids)
+
+        # Conv1D expects:
+        # batch × embedding × sequence
+        embedded_text = embedded_text.permute(0, 2, 1)
+
+        pooled_2 = self.apply_convolution(
+            embedded_text,
+            self.convolution_2
+        )
+
+        pooled_3 = self.apply_convolution(
+            embedded_text,
+            self.convolution_3
+        )
+
+        pooled_4 = self.apply_convolution(
+            embedded_text,
+            self.convolution_4
+        )
+
+        combined_features = torch.cat(
+            [pooled_2, pooled_3, pooled_4],
+            dim=1
+        )
+
+        combined_features = self.dropout(combined_features)
+
+        # One score for every option
+        option_scores = self.output_layer(combined_features)
+
+        # Changing shape to:
+        # batch × 5
+        option_scores = option_scores.view(
+            batch_size,
+            number_of_options
+        )
+
+        return option_scores
+
+
+
+model = TextCNNMultipleChoice(
+    vocabulary_size=vocabulary_size,
+    embedding_size=embedding_size,
+    number_of_filters=number_of_filters,
+    dropout_rate=dropout_rate
+)
+
+model = model.to(device)
+
+print(model)
+
+
+
+number_of_parameters = sum(
+    parameter.numel()
+    for parameter in model.parameters()
+    if parameter.requires_grad
+)
+
+print("Trainable parameters:", number_of_parameters)
+
+
+
+def calculate_map_at_3(correct_labels, prediction_probabilities):
+    total_score = 0
+
+    for row_number in range(len(correct_labels)):
+        correct_answer = correct_labels[row_number]
+
+        option_probabilities = prediction_probabilities[row_number]
+
+        top_three = np.argsort(option_probabilities)[::-1][:3]
+
+        if correct_answer == top_three[0]:
+            total_score += 1.0
+
+        elif correct_answer == top_three[1]:
+            total_score += 0.5
+
+        elif correct_answer == top_three[2]:
+            total_score += 1.0 / 3.0
+
+    map_at_3 = total_score / len(correct_labels)
+
+    return map_at_3
+
+
+
+
+
+loss_function = nn.CrossEntropyLoss()
+
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=learning_rate,
+    weight_decay=0.0001
+)
+
+
+use_amp = torch.cuda.is_available()
+
+scaler = torch.amp.GradScaler(
+    "cuda",
+    enabled=use_amp
+)
+
+print("Mixed precision enabled:", use_amp)
+
+
+
+def train_one_epoch(
+    model,
+    data_loader,
+    optimizer,
+    loss_function,
+    scaler,
+    device,
+    use_amp
+):
+    model.train()
+
+    total_loss = 0
+    total_correct = 0
+    total_examples = 0
+
+    for batch in data_loader:
+        input_ids = batch["input_ids"].to(device)
+        labels = batch["label"].to(device)
+
+        optimizer.zero_grad()
+
+        with torch.amp.autocast(
+            device_type="cuda",
+            enabled=use_amp
+        ):
+            scores = model(input_ids)
+
+            loss = loss_function(scores, labels)
+
+        scaler.scale(loss).backward()
+
+        scaler.unscale_(optimizer)
+
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_norm=1.0
+        )
+
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_loss += loss.item() * input_ids.size(0)
+
+        predictions = torch.argmax(scores, dim=1)
+
+        total_correct += (
+            predictions == labels
+        ).sum().item()
+
+        total_examples += labels.size(0)
+
+    average_loss = total_loss / total_examples
+    accuracy = total_correct / total_examples
+
+    return average_loss, accuracy
+
+
+
+def validate_model(
+    model,
+    data_loader,
+    loss_function,
+    device
+):
+    model.eval()
+
+    total_loss = 0
+    total_correct = 0
+    total_examples = 0
+
+    all_labels = []
+    all_probabilities = []
+
+    with torch.no_grad():
+
+        for batch in data_loader:
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["label"].to(device)
+
+            scores = model(input_ids)
+
+            loss = loss_function(scores, labels)
+
+            probabilities = torch.softmax(scores, dim=1)
+
+            predictions = torch.argmax(
+                probabilities,
+                dim=1
+            )
+
+            total_loss += loss.item() * input_ids.size(0)
+
+            total_correct += (
+                predictions == labels
+            ).sum().item()
+
+            total_examples += labels.size(0)
+
+            all_labels.extend(
+                labels.cpu().numpy()
+            )
+
+            all_probabilities.extend(
+                probabilities.cpu().numpy()
+            )
+
+    average_loss = total_loss / total_examples
+    accuracy = total_correct / total_examples
+
+    all_labels = np.array(all_labels)
+    all_probabilities = np.array(all_probabilities)
+
+    map_at_3 = calculate_map_at_3(
+        all_labels,
+        all_probabilities
+    )
+
+    return (
+        average_loss,
+        accuracy,
+        map_at_3,
+        all_probabilities
+    )
+
+
+
+# Loss function
+loss_function = nn.CrossEntropyLoss()
+
+# Optimizer
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=learning_rate,
+    weight_decay=0.0001
+)
+
+# Learning-rate scheduler
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode="max",
+    factor=0.5,
+    patience=1
+)
+
+# Mixed precision
+use_amp = torch.cuda.is_available()
+
+scaler = torch.amp.GradScaler(
+    "cuda",
+    enabled=use_amp
+)
+
+print("Loss function created")
+print("Optimizer created")
+print("Scheduler created")
+print("AMP enabled:", use_amp)
+
+
+
+required_items = {
+    "model": model,
+    "training_loader": training_loader,
+    "validation_loader": validation_loader,
+    "optimizer": optimizer,
+    "loss_function": loss_function,
+    "scheduler": scheduler,
+    "scaler": scaler,
+    "device": device
+}
+
+for item_name, item_value in required_items.items():
+    print(item_name, "is ready")
+
+
+
+training_history = []
+
+best_map_at_3 = 0
+best_epoch = 0
+
+model_save_path = "version_7_best_textcnn.pth"
+
+for epoch in range(number_of_epochs):
+
+    print("=" * 60)
+    print(f"Epoch {epoch + 1}/{number_of_epochs}")
+
+    training_loss, training_accuracy = train_one_epoch(
+        model=model,
+        data_loader=training_loader,
+        optimizer=optimizer,
+        loss_function=loss_function,
+        scaler=scaler,
+        device=device,
+        use_amp=use_amp
+    )
+
+    (
+        validation_loss,
+        validation_accuracy,
+        validation_map_at_3,
+        validation_probabilities
+    ) = validate_model(
+        model=model,
+        data_loader=validation_loader,
+        loss_function=loss_function,
+        device=device
+    )
+
+    scheduler.step(validation_map_at_3)
+
+    current_learning_rate = optimizer.param_groups[0]["lr"]
+
+    print(f"Training loss:       {training_loss:.4f}")
+    print(f"Training accuracy:   {training_accuracy:.4f}")
+    print(f"Validation loss:     {validation_loss:.4f}")
+    print(f"Validation accuracy: {validation_accuracy:.4f}")
+    print(f"Validation MAP@3:    {validation_map_at_3:.4f}")
+    print(f"Learning rate:       {current_learning_rate:.6f}")
+
+    training_history.append({
+        "epoch": epoch + 1,
+        "training_loss": training_loss,
+        "training_accuracy": training_accuracy,
+        "validation_loss": validation_loss,
+        "validation_accuracy": validation_accuracy,
+        "validation_map_at_3": validation_map_at_3,
+        "learning_rate": current_learning_rate
+    })
+
+    if validation_map_at_3 > best_map_at_3:
+        best_map_at_3 = validation_map_at_3
+        best_epoch = epoch + 1
+
+        torch.save(
+            model.state_dict(),
+            model_save_path
+        )
+
+        print("Best model saved.")
+
+print("=" * 60)
+print("Training completed")
+print("Best epoch:", best_epoch)
+print("Best validation MAP@3:", round(best_map_at_3, 4))
+
+
+
+history_dataframe = pd.DataFrame(training_history)
+
+history_dataframe
+
+history_dataframe.to_csv(
+    "version_7_training_history.csv",
+    index=False
+)
+
+
+
+plt.figure(figsize=(8, 5))
+
+plt.plot(
+    history_dataframe["epoch"],
+    history_dataframe["training_loss"],
+    marker="o",
+    label="Training Loss"
+)
+
+plt.plot(
+    history_dataframe["epoch"],
+    history_dataframe["validation_loss"],
+    marker="o",
+    label="Validation Loss"
+)
+
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Version 7: Training and Validation Loss")
+plt.legend()
+plt.grid()
+
+plt.show()
+
+
+plt.figure(figsize=(8, 5))
+
+plt.plot(
+    history_dataframe["epoch"],
+    history_dataframe["validation_map_at_3"],
+    marker="o"
+)
+
+plt.xlabel("Epoch")
+plt.ylabel("MAP@3")
+plt.title("Version 7: Validation MAP@3")
+plt.grid()
+
+plt.show()
+
+
+model.load_state_dict(
+    torch.load(
+        model_save_path,
+        map_location=device,
+        weights_only=True
+    )
+)
+
+model = model.to(device)
+
+print("Best model loaded from epoch:", best_epoch)
+
+
+(
+    final_validation_loss,
+    final_validation_accuracy,
+    final_validation_map_at_3,
+    final_validation_probabilities
+) = validate_model(
+    model=model,
+    data_loader=validation_loader,
+    loss_function=loss_function,
+    device=device
+)
+
+print("Final validation loss:", round(final_validation_loss, 4))
+print("Final validation accuracy:", round(final_validation_accuracy, 4))
+print("Final validation MAP@3:", round(final_validation_map_at_3, 4))
+
+
+
+validation_output = validation_data[
+    ["id", "prompt", "answer"]
+].copy()
+
+predicted_numbers = np.argmax(
+    final_validation_probabilities,
+    axis=1
+)
+
+predicted_answers = []
+
+for number in predicted_numbers:
+    predicted_answers.append(
+        number_to_answer[number]
+    )
+
+validation_output["predicted_answer"] = predicted_answers
+
+validation_output["correct"] = (
+    validation_output["answer"]
+    == validation_output["predicted_answer"]
+)
+
+validation_output.head(10)
+
+
+
+def predict_test_data(
+    model,
+    data_loader,
+    device
+):
+    model.eval()
+
+    all_probabilities = []
+
+    with torch.no_grad():
+
+        for batch in data_loader:
+            input_ids = batch["input_ids"].to(device)
+
+            scores = model(input_ids)
+
+            probabilities = torch.softmax(
+                scores,
+                dim=1
+            )
+
+            all_probabilities.extend(
+                probabilities.cpu().numpy()
+            )
+
+    all_probabilities = np.array(all_probabilities)
+
+    return all_probabilities
+
+
+
+test_probabilities = predict_test_data(
+    model=model,
+    data_loader=test_loader,
+    device=device
+)
+
+print("Test probability shape:", test_probabilities.shape)
+
+
+test_prediction_numbers = np.argmax(
+    test_probabilities,
+    axis=1
+)
+
+final_answers = []
+
+for number in test_prediction_numbers:
+    final_answers.append(
+        number_to_answer[number]
+    )
+
+print(final_answers[:10])
+
+
+submission = pd.DataFrame()
+
+submission["ID"] = test["id"]
+submission["Prediction"] = final_answers
+
+submission.head()
+
+submission.to_csv(
+    "submission.csv",
+    index=False
+)
+
+print("Submission file created successfully.")
+
+
+print("Submission shape:", submission.shape)
+
+print("\nSubmission columns:")
+print(submission.columns.tolist())
+
+print("\nMissing values:")
+print(submission.isnull().sum())
+
+print("\nPrediction distribution:")
+print(submission["Prediction"].value_counts().sort_index())
+
+print("\nUnique predictions:")
+print(sorted(submission["Prediction"].unique()))
+
+
+assert len(submission) == len(test)
+
+assert submission["Prediction"].isin(
+    ["A", "B", "C", "D", "E"]
+).all()
+
+assert submission["Prediction"].isnull().sum() == 0
+
+print("Submission validation passed.")
