@@ -1,0 +1,286 @@
+!pip install -q wandb
+
+from kaggle_secrets import UserSecretsClient
+import os, wandb
+
+api_key = UserSecretsClient().get_secret("Wandb_key")
+os.environ["Wandb_key"] = api_key
+
+wandb.login()
+
+
+import random
+
+import wandb
+
+run = wandb.init(
+    entity="21f2000522-indian-institute-of-technology-madras",
+    project="BiGRU MOdel",
+    config={
+        "learning_rate": 0.00001,
+        "architecture": "RNN",
+        "dataset": "Kaggle dataset",
+        "epochs": 10,
+    },
+)
+
+
+def evaluate_bigru(model, data_loader):
+    model.eval()
+
+    probabilities_all = []
+    targets_all = []
+    total_loss = 0.0
+
+    loss_function = nn.CrossEntropyLoss()
+
+    with torch.no_grad():
+        for batch in data_loader:
+            prompt_ids = batch["prompt"].to(device)
+            option_ids = batch["options"].to(device)
+            targets = batch["label"].to(device)
+
+            with torch.cuda.amp.autocast(
+                enabled=torch.cuda.is_available()
+            ):
+                scores = model(
+                    prompt_ids,
+                    option_ids
+                )
+
+                loss = loss_function(
+                    scores,
+                    targets
+                )
+
+            probabilities = torch.softmax(
+                scores.float(),
+                dim=1
+            )
+
+            total_loss += loss.item()
+
+            probabilities_all.append(
+                probabilities.cpu().numpy()
+            )
+
+            targets_all.append(
+                targets.cpu().numpy()
+            )
+
+    probabilities_all = np.concatenate(
+        probabilities_all
+    )
+
+    targets_all = np.concatenate(
+        targets_all
+    )
+
+    accuracy = np.mean(
+        np.argmax(
+            probabilities_all,
+            axis=1
+        ) == targets_all
+    )
+
+    map3_score = compute_map3(
+        probabilities_all,
+        targets_all
+    )
+
+    return (
+        total_loss / len(data_loader),
+        accuracy,
+        map3_score
+    )
+
+
+def train_bigru_model(
+    train_dataframe,
+    validation_dataframe,
+    save_path="best_bigru_scratch.pth"
+):
+    vocabulary_texts = []
+
+    for _, row in train_dataframe.iterrows():
+        vocabulary_texts.append(str(row["prompt"]))
+
+        for option_column in ["A", "B", "C", "D", "E"]:
+            vocabulary_texts.append(
+                str(row[option_column])
+            )
+
+    vocabulary = TextVocabulary(
+        vocabulary_texts,
+        max_size=12000
+    )
+
+    train_dataset = CustomMCQDataset(
+        train_dataframe,
+        vocabulary
+    )
+
+    validation_dataset = CustomMCQDataset(
+        validation_dataframe,
+        vocabulary
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BIGRU_BATCH_SIZE,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=torch.cuda.is_available()
+    )
+
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_size=BIGRU_BATCH_SIZE,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=torch.cuda.is_available()
+    )
+
+    model = BiGRUMCQModel(
+        vocabulary_size=len(vocabulary),
+        embedding_dimension=BIGRU_EMBED_DIM,
+        hidden_dimension=BIGRU_HIDDEN_DIM,
+        dropout=BIGRU_DROPOUT
+    ).to(device)
+
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=BIGRU_LR,
+        weight_decay=1e-4
+    )
+
+    loss_function = nn.CrossEntropyLoss()
+
+    scaler = torch.cuda.amp.GradScaler(
+        enabled=torch.cuda.is_available()
+    )
+
+    best_map3 = -1.0
+    patience = 0
+
+    for epoch in range(1, BIGRU_EPOCHS + 1):
+        model.train()
+        running_loss = 0.0
+
+        for batch in train_loader:
+            prompt_ids = batch["prompt"].to(device)
+            option_ids = batch["options"].to(device)
+            targets = batch["label"].to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.cuda.amp.autocast(
+                enabled=torch.cuda.is_available()
+            ):
+                scores = model(
+                    prompt_ids,
+                    option_ids
+                )
+
+                loss = loss_function(
+                    scores,
+                    targets
+                )
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                1.0
+            )
+
+            scaler.step(optimizer)
+            scaler.update()
+
+            running_loss += loss.item()
+
+        (
+            validation_loss,
+            validation_accuracy,
+            validation_map3
+        ) = evaluate_bigru(
+            model,
+            validation_loader
+        )
+
+        run.log(
+        {"Traning_loss": running_loss / len(train_loader)})
+
+        run.log(
+        {"Val_Accuracy": validation_accuracy, "Val_loss": validation_loss,"Val_MAP3":validation_map3}
+    )
+
+        print(
+            f"Epoch {epoch}: "
+            f"train_loss={running_loss / len(train_loader):.4f}, "
+            f"val_loss={validation_loss:.4f}, "
+            f"accuracy={validation_accuracy:.4f}, "
+            f"MAP@3={validation_map3:.4f}"
+        )
+
+        if validation_map3 > best_map3:
+            best_map3 = validation_map3
+            patience = 0
+
+            torch.save(
+                model.state_dict(),
+                save_path
+            )
+
+        else:
+            patience += 1
+
+        if patience >= 6:
+            print("Early stopping")
+            break
+
+    model.load_state_dict(
+        torch.load(
+            save_path,
+            map_location=device
+        )
+    )
+
+    (
+        validation_loss,
+        validation_accuracy,
+        validation_map3
+    ) = evaluate_bigru(
+        model,
+        validation_loader
+    )
+
+    return validation_accuracy, validation_map3
+
+
+if RUN_SCRATCH_TRAINING:
+    print("=" * 60)
+    print("MODEL 1: BiGRU BUILT FROM SCRATCH")
+    print("=" * 60)
+
+    best_bigru_accuracy, best_bigru_map3 = train_bigru_model(
+        folds_data[0]["train"],
+        folds_data[0]["val"]
+    )
+
+    print("BiGRU accuracy:", round(best_bigru_accuracy, 4))
+    print("BiGRU MAP@3 :", round(best_bigru_map3, 4))
+
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+else:
+    best_bigru_accuracy = 0.0
+    best_bigru_map3 = 0.0
+
+
+run.finish()
+
