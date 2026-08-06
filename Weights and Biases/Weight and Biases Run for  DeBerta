@@ -1,0 +1,93 @@
+!pip install -q wandb
+
+from kaggle_secrets import UserSecretsClient
+import os, wandb
+
+api_key = UserSecretsClient().get_secret("Wandb_key")
+os.environ["Wandb_key"] = api_key
+
+wandb.login()
+
+import random
+
+import wandb
+
+run = wandb.init(
+    entity="21f2000522-indian-institute-of-technology-madras",
+    project="DeBERTa-v3-base",
+    config={
+        "learning_rate": 1e-5,
+        "architecture": "Transformer",
+        "dataset": "Kaggle dataset",
+        "epochs": 4,
+    },
+)
+
+
+RUN_DEBERTA = True
+
+deberta_fold_scores = []
+
+if RUN_DEBERTA:
+
+    print("\n" + "=" * 60)
+    print("TRAINING DEBERTA-V3-BASE")
+    print("=" * 60)
+
+    for fold in range(5):
+
+        print(
+            f"\nDeBERTa Fold {fold + 1}/5"
+        )
+
+        train_fold = folds_data[fold]["train_aug"]
+        validation_fold = folds_data[fold]["val_aug"]
+
+        deberta_score = run_transformer_training(
+            model_name=DEBERTA_MODEL_PATH,
+            save_path=f"/kaggle/working/deberta_fold_{fold}",
+            train_dataframe=train_fold,
+            validation_dataframe=validation_fold,
+            batch_size=TRANSFORMER_BATCH_SIZE,
+            epochs=TRANSFORMER_EPOCHS,
+            learning_rate=DEBERTA_LR,
+            max_len=128
+        )
+
+        deberta_fold_scores.append(
+            deberta_score
+        )
+
+        print(
+            f"DeBERTa Fold {fold + 1} MAP@3: "
+            f"{deberta_score:.4f}"
+        )
+
+        run.log(
+        { "Debert_score":deberta_score}
+    )
+
+        gc.collect()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    best_deberta_map3 = float(
+        np.mean(deberta_fold_scores)
+    )
+
+    print("\n" + "=" * 60)
+    print(
+        f"Mean DeBERTa MAP@3: "
+        f"{best_deberta_map3:.4f}"
+    )
+    print("=" * 60)
+
+else:
+    best_deberta_map3 = 0.0
+
+run.finish()
+
+
+
+
