@@ -1,0 +1,77 @@
+import random
+
+import wandb
+
+run = wandb.init(
+    entity="21f2000522-indian-institute-of-technology-madras",
+    project="Roberta-base",
+    config={
+        "learning_rate": 1e-5,
+        "architecture": "Transformer",
+        "dataset": "Kaggle dataset",
+        "epochs": 4,
+    },
+)
+
+
+RUN_ROBERTA = True
+
+roberta_fold_scores = []
+
+if RUN_ROBERTA:
+
+    print("\n" + "=" * 60)
+    print("TRAINING ROBERTA-BASE")
+    print("=" * 60)
+
+    for fold in range(5):
+
+        print(
+            f"\nRoBERTa Fold {fold + 1}/5"
+        )
+
+        train_fold = folds_data[fold]["train_aug"]
+        validation_fold = folds_data[fold]["val_aug"]
+
+        roberta_score = run_transformer_training(
+            model_name=ROBERTA_MODEL_PATH,
+            save_path=f"/kaggle/working/roberta_fold_{fold}",
+            train_dataframe=train_fold,
+            validation_dataframe=validation_fold,
+            batch_size=TRANSFORMER_BATCH_SIZE,
+            epochs=TRANSFORMER_EPOCHS,
+            learning_rate=ROBERTA_LR,
+            max_len=128
+        )
+
+        roberta_fold_scores.append(
+            roberta_score
+        )
+
+        print(
+            f"RoBERTa Fold {fold + 1} MAP@3: "
+            f"{roberta_score:.4f}"
+        )
+
+         run.log({ "Debert_score":roberta_score})
+
+        gc.collect()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    best_roberta_map3 = float(
+        np.mean(roberta_fold_scores)
+    )
+
+    print("\n" + "=" * 60)
+    print(
+        f"Mean RoBERTa MAP@3: "
+        f"{best_roberta_map3:.4f}"
+    )
+    print("=" * 60)
+
+else:
+    best_roberta_map3 = 0.0
+
+ run.finish()
